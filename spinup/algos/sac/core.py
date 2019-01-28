@@ -53,9 +53,9 @@ def mlp_gaussian_policy(x, a, hidden_sizes, activation, output_activation):
     net could produce extremely large values for the log_stds, which
     would result in some actions being either entirely deterministic
     or too random to come back to earth. Either of these introduces
-    numerical instability which could break the algorithm. To 
-    protect against that, we'll constrain the output range of the 
-    log_stds, to lie within [LOG_STD_MIN, LOG_STD_MAX]. This is 
+    numerical instability which could break the algorithm. To
+    protect against that, we'll constrain the output range of the
+    log_stds, to lie within [LOG_STD_MIN, LOG_STD_MAX]. This is
     slightly different from the trick used by the original authors of
     SAC---they used tf.clip_by_value instead of squashing and rescaling.
     I prefer this approach because it allows gradient propagation
@@ -81,7 +81,7 @@ def apply_squashing_func(mu, pi, logp_pi):
 """
 Actor-Critics
 """
-def mlp_actor_critic(x, a, hidden_sizes=(400,300), activation=tf.nn.relu, 
+def mlp_actor_critic(x, a, hidden_sizes=(400,300), activation=tf.nn.relu,
                      output_activation=None, policy=mlp_gaussian_policy, action_space=None):
     # policy
     with tf.variable_scope('pi'):
@@ -106,3 +106,4 @@ def mlp_actor_critic(x, a, hidden_sizes=(400,300), activation=tf.nn.relu,
     with tf.variable_scope('v'):
         v = vf_mlp(x)
     return mu, pi, logp_pi, q1, q2, q1_pi, q2_pi, v
+

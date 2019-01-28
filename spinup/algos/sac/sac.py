@@ -13,9 +13,9 @@ class ReplayBuffer:
     """
 
     def __init__(self, obs_dim, act_dim, size):
-        self.obs1_buf = np.zeros([size, obs_dim], dtype=np.float32)
-        self.obs2_buf = np.zeros([size, obs_dim], dtype=np.float32)
-        self.acts_buf = np.zeros([size, act_dim], dtype=np.float32)
+        self.obs1_buf = np.zeros([size] + list(obs_dim), dtype=np.float32)
+        self.obs2_buf = np.zeros([size] + list(obs_dim), dtype=np.float32)
+        self.acts_buf = np.zeros([size] + list(act_dim), dtype=np.float32)
         self.rews_buf = np.zeros(size, dtype=np.float32)
         self.done_buf = np.zeros(size, dtype=np.float32)
         self.ptr, self.size, self.max_size = 0, 0, size
@@ -38,36 +38,39 @@ class ReplayBuffer:
                     done=self.done_buf[idxs])
 
 class SAC:
-    def __init__(self, sess, config, action_space, observation_space):
+    def __init__(self, sess, config, action_space, observation_space,
+            actor_critic=core.mlp_actor_critic):
         self.sess = sess
         self.config = config
         self.action_space = action_space
+        self.observation_space = observation_space
         self.obs_dim = observation_space.shape[0]
         self.act_dim = action_space.shape[0]
 
-        self._build_graph()
+        self._build_graph(actor_critic)
 
         # Experience buffer
-        self.replay_buffer = ReplayBuffer(obs_dim=self.obs_dim,
-                act_dim=self.act_dim, size=self.config.replay_size)
+        self.replay_buffer = ReplayBuffer(obs_dim=observation_space.shape,
+                act_dim=action_space.shape, size=self.config.replay_size)
 
-    def _build_graph(self):
+    def _build_graph(self, actor_critic):
         # Inputs to computation graph
-        self.x_ph, self.a_ph, self.x2_ph, self.r_ph, self.d_ph = core.placeholders(
-                self.obs_dim, self.act_dim, self.obs_dim, None, None)
+        self.x_ph = tf.placeholder(tf.float32, (None,) + self.observation_space.shape, name='x_ph')
+        self.a_ph = tf.placeholder(tf.float32, (None,) + self.action_space.shape, name='a_ph')
+        self.x2_ph = tf.placeholder(tf.float32, (None,) + self.observation_space.shape, name='x2_ph')
+        self.r_ph = tf.placeholder(tf.float32, (None, 1), name='r_ph')
+        self.d_ph = tf.placeholder(tf.float32, (None, 1), name='d_ph')
 
         # Main outputs from computation graph
         with tf.variable_scope('main'):
-            self.mu, self.pi, self.logp_pi, self.q1, self.q2, self.q1_pi, self.q2_pi, self.v = core.mlp_actor_critic(
+            self.mu, self.pi, self.logp_pi, self.q1, self.q2, self.q1_pi, self.q2_pi, self.v = actor_critic(
                     self.x_ph, self.a_ph,
-                    hidden_sizes=[32, 8],
                     activation=tf.nn.elu,
                     action_space=self.action_space)
 
         # Target value network
         with tf.variable_scope('target'):
-            _, _, _, _, _, _, _, self.v_targ  = core.mlp_actor_critic(self.x2_ph, self.a_ph,
-                    hidden_sizes=[32, 8],
+            _, _, _, _, _, _, _, self.v_targ  = actor_critic(self.x2_ph, self.a_ph,
                     activation=tf.nn.elu,
                     action_space=self.action_space)
 
@@ -109,7 +112,7 @@ class SAC:
 
     def act(self, observation, deterministic=False):
         act_op = self.mu if deterministic else self.pi
-        return self.sess.run(act_op, feed_dict={self.x_ph: observation.reshape(1,-1)})[0]
+        return self.sess.run(act_op, feed_dict={ self.x_ph: observation })[0]
 
     def observe(self, obs, action, reward, obs_next, done):
         self.replay_buffer.store(obs, action, reward, obs_next, done)
