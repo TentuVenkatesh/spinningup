@@ -12,54 +12,73 @@ class ReplayBuffer:
     A simple FIFO experience replay buffer for SAC agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size):
-        self.obs1_buf = np.zeros([size] + list(obs_dim), dtype=np.float32)
-        self.obs2_buf = np.zeros([size] + list(obs_dim), dtype=np.float32)
-        self.acts_buf = np.zeros([size] + list(act_dim), dtype=np.float32)
-        self.rews_buf = np.zeros(size, dtype=np.float32)
-        self.done_buf = np.zeros(size, dtype=np.float32)
+    def __init__(self, observations, act_dim, size):
+        self.obs1_buffers = {}
+        self.obs2_buffers = {}
+        for name, space in observations.items():
+            self.obs1_buffers[name] = np.zeros([size] + list(space.shape), dtype=np.float32)
+            self.obs2_buffers[name] = np.zeros([size] + list(space.shape), dtype=np.float32)
+        self.action_buffer = np.zeros([size] + list(act_dim), dtype=np.float32)
+        self.reward_buffer = np.zeros(size, dtype=np.float32)
+        self.done_buffer = np.zeros(size, dtype=np.float32)
         self.ptr, self.size, self.max_size = 0, 0, size
 
     def store(self, obs, act, rew, next_obs, done):
-        self.obs1_buf[self.ptr] = obs
-        self.obs2_buf[self.ptr] = next_obs
-        self.acts_buf[self.ptr] = act
-        self.rews_buf[self.ptr] = rew
-        self.done_buf[self.ptr] = done
+        for name in self.obs1_buffers.keys():
+            self.obs1_buffers[name][self.ptr] = obs[name]
+            self.obs2_buffers[name][self.ptr] = next_obs[name]
+        self.action_buffer[self.ptr] = act
+        self.reward_buffer[self.ptr] = rew
+        self.done_buffer[self.ptr] = done
         self.ptr = (self.ptr+1) % self.max_size
         self.size = min(self.size+1, self.max_size)
 
     def sample_batch(self, batch_size=32):
         idxs = np.random.randint(0, self.size, size=batch_size)
-        return dict(obs1=self.obs1_buf[idxs],
-                    obs2=self.obs2_buf[idxs],
-                    acts=self.acts_buf[idxs],
-                    rews=self.rews_buf[idxs],
-                    done=self.done_buf[idxs])
+        obs1 = {}
+        obs2 = {}
+        for name in self.obs1_buffers.keys():
+            obs1[name] = self.obs1_buffers[name][idxs]
+            obs2[name] = self.obs2_buffers[name][idxs]
+        return dict(obs1=obs1,
+                    obs2=obs2,
+                    acts=self.action_buffer[idxs],
+                    rews=self.reward_buffer[idxs],
+                    done=self.done_buffer[idxs])
 
 class SAC:
-    def __init__(self, sess, config, action_space, observation_space,
+    def __init__(self, sess, config, action_space, observations,
             actor_critic=core.mlp_actor_critic):
         self.sess = sess
         self.config = config
         self.action_space = action_space
-        self.observation_space = observation_space
-        self.obs_dim = observation_space.shape[0]
+        if not isinstance(observations, dict):
+            # Observation space in the case of just one observation.
+            observations = { 'input': observations }
+
+        self.observations = observations
         self.act_dim = action_space.shape[0]
 
         self._build_graph(actor_critic)
 
         # Experience buffer
-        self.replay_buffer = ReplayBuffer(obs_dim=observation_space.shape,
+        self.replay_buffer = ReplayBuffer(observations=observations,
                 act_dim=action_space.shape, size=self.config.replay_size)
 
     def _build_graph(self, actor_critic):
         # Inputs to computation graph
-        self.x_ph = tf.placeholder(tf.float32, (None,) + self.observation_space.shape, name='x_ph')
+        self.x_ph = {}
+        self.x2_ph = {}
+        for name, space in self.observations.items():
+            self.x_ph[name] = tf.placeholder(tf.float32, (None,) + space.shape, name='x_{}_ph'.format(name))
+            self.x2_ph[name] = tf.placeholder(tf.float32, (None,) + space.shape, name='x_{}_ph'.format(name))
         self.a_ph = tf.placeholder(tf.float32, (None,) + self.action_space.shape, name='a_ph')
-        self.x2_ph = tf.placeholder(tf.float32, (None,) + self.observation_space.shape, name='x2_ph')
-        self.r_ph = tf.placeholder(tf.float32, (None, 1), name='r_ph')
-        self.d_ph = tf.placeholder(tf.float32, (None, 1), name='d_ph')
+        self.r_ph = tf.placeholder(tf.float32, (None,), name='r_ph')
+        self.d_ph = tf.placeholder(tf.float32, (None,), name='d_ph')
+
+
+        log_alpha = tf.Variable(1.0, trainable=True, dtype=tf.float32)
+        self.alpha = tf.exp(log_alpha)
 
         # Main outputs from computation graph
         with tf.variable_scope('main'):
@@ -79,14 +98,19 @@ class SAC:
 
         # Targets for Q and V regression
         q_backup = tf.stop_gradient(self.r_ph + self.config.gamma*(1-self.d_ph)*self.v_targ)
-        v_backup = tf.stop_gradient(min_q_pi - self.config.alpha * self.logp_pi)
+        v_backup = tf.stop_gradient(min_q_pi - self.alpha * self.logp_pi)
 
         # Soft actor-critic losses
-        pi_loss = tf.reduce_mean(self.config.alpha * self.logp_pi - self.q1_pi)
+        pi_loss = tf.reduce_mean(self.alpha * self.logp_pi - min_q_pi)
         q1_loss = 0.5 * tf.reduce_mean((q_backup - self.q1)**2)
         q2_loss = 0.5 * tf.reduce_mean((q_backup - self.q2)**2)
         v_loss = 0.5 * tf.reduce_mean((v_backup - self.v)**2)
         value_loss = q1_loss + q2_loss + v_loss
+
+        alpha_loss = -tf.reduce_mean(log_alpha * tf.stop_gradient(self.logp_pi + self.config.entropy_level))
+
+        alpha_optimizer = tf.train.AdamOptimizer(learning_rate=self.config.lr)
+        minimize_alpha = alpha_optimizer.minimize(alpha_loss, var_list=[log_alpha])
 
         # Policy train op
         # (has to be separate from value train op, because q1_pi appears in pi_loss)
@@ -108,11 +132,14 @@ class SAC:
 
         # All ops to call during one training step
         self.step_ops = [pi_loss, q1_loss, q2_loss, v_loss, self.q1, self.q2, self.v, self.logp_pi,
-                    train_pi_op, train_value_op, target_update]
+                    train_pi_op, train_value_op, target_update, minimize_alpha]
 
     def act(self, observation, deterministic=False):
         act_op = self.mu if deterministic else self.pi
-        return self.sess.run(act_op, feed_dict={ self.x_ph: observation })[0]
+        feed_dict = {}
+        for name, placeholder in self.x_ph.items():
+            feed_dict[placeholder] = observation[name]
+        return self.sess.run(act_op, feed_dict=feed_dict)[0]
 
     def observe(self, obs, action, reward, obs_next, done):
         self.replay_buffer.store(obs, action, reward, obs_next, done)
@@ -120,12 +147,16 @@ class SAC:
     def train(self):
         """Does one training iteration."""
         batch = self.replay_buffer.sample_batch(self.config.batch_size)
-        feed_dict = {self.x_ph: batch['obs1'],
-                     self.x2_ph: batch['obs2'],
+        feed_dict = {
                      self.a_ph: batch['acts'],
                      self.r_ph: batch['rews'],
                      self.d_ph: batch['done'],
                     }
+        for name in self.observations.keys():
+            obs1_ph = self.x_ph[name]
+            obs2_ph = self.x2_ph[name]
+            feed_dict[obs1_ph] = batch['obs1'][name]
+            feed_dict[obs2_ph] = batch['obs2'][name]
         return self.sess.run(self.step_ops, feed_dict)
 
     def initialize(self):
@@ -134,10 +165,12 @@ class SAC:
 
     def _initializer_ops(self):
         global_init = tf.global_variables_initializer()
+        return [global_init, self._assign_targets()]
+
+    def _assign_targets(self):
         # Initializing targets to match main variables
-        target_init = tf.group([tf.assign(v_targ, v_main)
+        return tf.group([tf.assign(v_targ, v_main)
                                   for v_main, v_targ in zip(get_vars('main'), get_vars('target'))])
-        return [global_init, target_init]
 
 
 """
@@ -241,7 +274,7 @@ def sac(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
     env, test_env = env_fn(), env_fn()
 
     config = Namespace(gamma=0.99,
-            alpha=0.2,
+            entropy_level=-1,
             lr=1e-3,
             batch_size=128,
             polyak=0.995,
@@ -251,7 +284,7 @@ def sac(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
     sac.initialize()
 
     # Setup model saving
-    logger.setup_tf_saver(sess, inputs={'x': sac.x_ph, 'a': sac.a_ph},
+    logger.setup_tf_saver(sess, inputs={'x': sac.x_ph['input'], 'a': sac.a_ph},
                                 outputs={'mu': sac.mu, 'pi': sac.pi, 'q1': sac.q1, 'q2': sac.q2, 'v': sac.v})
 
     def test_agent(n=10):
@@ -259,7 +292,7 @@ def sac(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
             obs, reward, done, ep_ret, ep_len = test_env.reset(), 0, False, 0, 0
             while not(done or (ep_len == max_ep_len)):
                 # Take deterministic actions at test time
-                obs, reward, done, _ = test_env.step(sac.act(obs, deterministic=True))
+                obs, reward, done, _ = test_env.step(sac.act({'input': obs[None]}, deterministic=True))
                 ep_ret += reward
                 ep_len += 1
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
@@ -276,7 +309,7 @@ def sac(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         use the learned policy.
         """
         if t > start_steps:
-            action = sac.act(obs)
+            action = sac.act({'input': obs[None]})
         else:
             action = env.action_space.sample()
 
@@ -291,7 +324,7 @@ def sac(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         done = False if ep_len==max_ep_len else done
 
         # Store experience to replay buffer
-        sac.observe(obs, action, reward, obs_next, done)
+        sac.observe({'input': obs}, action, reward, {'input': obs_next}, done)
 
         # Super critical, easy to overlook step: make sure to update
         # most recent observation!

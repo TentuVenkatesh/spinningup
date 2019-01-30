@@ -83,6 +83,8 @@ Actor-Critics
 """
 def mlp_actor_critic(x, a, hidden_sizes=(400,300), activation=tf.nn.relu,
                      output_activation=None, policy=mlp_gaussian_policy, action_space=None):
+    # Only works with one input. Define custom policy function for several observations.
+    x = x['input']
     # policy
     with tf.variable_scope('pi'):
         mu, pi, logp_pi = policy(x, a, hidden_sizes, activation, output_activation)
